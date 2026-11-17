@@ -1,4 +1,4 @@
-/* BreakBench v3.3 team adapter: shared Supabase backend with allowlisted Auth accounts. */
+/* BreakBench v3.4 team adapter: shared Supabase backend with allowlisted Auth accounts. */
 (() => {
 'use strict';
 const PROJECT_URL = 'https://avgqxqcbphlqjbcjxqjf.supabase.co';
@@ -72,26 +72,29 @@ function onError(error){ logStatus('Sync issue'); authView('login','Cloud connec
 function makeRows() {
  const map = new Map();
  map.set('settings',{id:'settings',kind:'settings',payload:clone(state.settings)});
- map.set('draft',{id:'draft',kind:'draft',payload:clone(state.draft)});
- map.set('selection',{id:'selection',kind:'selection',payload:clone(state.selected)});
+ for (const draft of state.drafts||[]) map.set('draft:'+draft.id,{id:'draft:'+draft.id,kind:'draft',payload:clone(draft)});
  for(const item of state.library)map.set('checklist:'+item.id,{id:'checklist:'+item.id,kind:'checklist',payload:clone(item)});
  for(const item of state.saved)map.set('price:'+item.id,{id:'price:'+item.id,kind:'price',payload:clone(item)});
  return map;
 }
 function hydrate(list){
  const remote=new Map(list.map(row=>[row.id,row]));
- const fresh=defaults();
+ const fresh=defaults();fresh.drafts=[];
+ let legacy=null,legacySelection=[];
  for(const row of list){
   if(row.id==='settings' && row.kind==='settings')fresh.settings=row.payload;
-  if(row.id==='draft' && row.kind==='draft')fresh.draft=row.payload;
-  if(row.id==='selection' && row.kind==='selection')fresh.selected=row.payload;
+  if(row.id==='draft' && row.kind==='draft')legacy=row.payload;
+  if(row.id==='selection' && row.kind==='selection' && Array.isArray(row.payload))legacySelection=row.payload;
+  if(row.id.startsWith('draft:') && row.kind==='draft' && row.payload)fresh.drafts.push(row.payload);
   if(row.kind==='checklist' && row.payload?.id)fresh.library.push(row.payload);
   if(row.kind==='price' && row.payload?.id)fresh.saved.push(row.payload);
  }
+ if(!fresh.drafts.length && legacy){legacy=clone(legacy);legacy.id=legacy.id||uid();legacy.checklistIds=Array.isArray(legacy.checklistIds)?legacy.checklistIds:legacySelection;fresh.drafts=[legacy]}
+ if(!fresh.drafts.length)fresh.drafts=[emptyDraft()];
  fresh.library.sort((a,b)=>String(b.created||'').localeCompare(String(a.created||'')));
  fresh.saved.sort((a,b)=>String(b.date||'').localeCompare(String(a.date||'')));
- state=fresh;
- rows=remote;
+ state=fresh;rows=remote;
+ ensureDrafts();
  try{localStorage.setItem(KEY,JSON.stringify(state))}catch{}
  render();
 }
