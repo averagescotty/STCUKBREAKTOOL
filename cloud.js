@@ -8,9 +8,33 @@ const status = document.getElementById('cloudStatus');
 const $c = id => document.getElementById(id);
 let client, memberUser = null, rows = new Map(), writing = false, dirty = false, timer = null, remoteTimer = null, channel = null;
 const stable = v => JSON.stringify(v);
+// Capture the link type before Supabase removes auth tokens from the URL.
+const incomingParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+const incomingType = incomingParams.get('type') || new URLSearchParams(window.location.search).get('type');
+let passwordSetupMode = incomingType === 'recovery' || incomingType === 'invite';
+let passwordSetupReady = false;
+let sessionCheckSerial = 0;
+function authView(mode, message, detail='') {
+  show(message,detail);
+  $c('cloudAuthForm').hidden = mode !== 'login';
+  $c('cloudForgotForm').hidden = mode !== 'forgot';
+  $c('cloudResetForm').hidden = mode !== 'reset';
+  $c('cloudSignup').hidden = mode !== 'login';
+  $c('cloudForgot').hidden = mode !== 'login';
+  $c('cloudBack').hidden = mode !== 'forgot';
+  $c('checkAccess').hidden = true;
+  $c('cloudSignout').hidden = mode !== 'login';
+}
+function openPasswordSetup(){
+ passwordSetupMode=true;passwordSetupReady=true;
+ authView('reset','Set your BreakBench password','Enter and confirm a new password for your existing account.');
+ logStatus('Password setup required');
+}
+function appRedirectUrl(){return window.location.origin + window.location.pathname;}
+
 function show(message, detail='') { $c('gateMessage').textContent=message; $c('gateDetail').textContent=detail; root.hidden=false; }
 function logStatus(s) { status.textContent=s; }
-function onError(error){ logStatus('Sync issue'); show('Cloud connection issue', (error && error.message) || String(error)); $c('cloudAuthForm').hidden=false; }
+function onError(error){ logStatus('Sync issue'); authView('login','Cloud connection issue', (error && error.message) || String(error)); }
 function makeRows() {
  const map = new Map();
  map.set('settings',{id:'settings',kind:'settings',payload:clone(state.settings)});
@@ -104,13 +128,23 @@ function subscribe(){
   });
 }
 async function sessionChanged(session){
- if(!session){memberUser=null;root.hidden=false;$c('cloudAuthForm').hidden=false;show('Sign in to BreakBench','Only approved team members can access shared data.');logStatus('Sign in required');if(channel){client.removeChannel(channel);channel=null}return}
+ const callId=++sessionCheckSerial;
+ if(passwordSetupMode){
+   if(session) {openPasswordSetup();return}
+   if(passwordSetupReady) return;
+   passwordSetupMode=false;
+   authView('login','Could not open the password link','The link may be invalid or expired. Tap Forgot password to request a new email.');
+   logStatus('Sign in required');
+   return;
+ }
+ if(!session){memberUser=null;authView('login','Sign in to BreakBench','Only approved team members can access shared data.');logStatus('Sign in required');if(channel){client.removeChannel(channel);channel=null}return}
  const user=session.user;
  const {data,error}=await client.from('breakbench_team_members').select('user_id').eq('user_id',user.id).maybeSingle();
+ if(callId!==sessionCheckSerial)return;
  if(error){onError(error);return}
- if(!data){memberUser=null;show('Account created — awaiting approval','Your email: '+user.email+'. A project owner must add this account to the team using the included SQL instructions. Then tap Check access.');$c('cloudAuthForm').hidden=true;$c('checkAccess').hidden=false;logStatus('Awaiting team approval');return}
+ if(!data){memberUser=null;authView('login','Account awaiting approval','Your email: '+user.email+'. A project owner must add this account to the team, then tap Check access.');$c('cloudAuthForm').hidden=true;$c('checkAccess').hidden=false;logStatus('Awaiting team approval');return}
  memberUser=user;
- try{await reloadCloud();subscribe();root.hidden=true;$c('checkAccess').hidden=true;}
+ try{await reloadCloud();if(callId!==sessionCheckSerial)return;subscribe();root.hidden=true;$c('checkAccess').hidden=true;}
  catch(e){onError(e)}
 }
 async function init(){
@@ -123,20 +157,62 @@ async function init(){
   logStatus('Signing in…');
   const {error}=await client.auth.signInWithPassword({email,password});
   $c('cloudSubmit').disabled=false;
-  if(error)show('Could not sign in',error.message);
+  if(error)authView('login','Could not sign in',error.message + ' If you joined using an email invitation, use Forgot password to set a new password.');
  };
  $c('cloudSignup').onclick=async()=>{
   const email=$c('cloudEmail').value.trim(),password=$c('cloudPassword').value;
   if(!email||password.length<6)return show('Enter your email and password','Use at least 6 characters for the password.');
   const {error}=await client.auth.signUp({email,password});
-  if(error)show('Sign-up issue',error.message);
-  else show('Check your email','Confirm your email if Supabase requires it, then sign in. The project owner must approve your account before you can see shared data.');
+  if(error)authView('login','Sign-up issue',error.message);
+  else authView('login','Check your email','If this email already has an account, use Forgot password instead of Create account. Your project owner must approve your access.');
+ };
+ $c('cloudForgot').onclick=()=>{
+  $c('cloudRecoveryEmail').value=$c('cloudEmail').value.trim();
+  authView('forgot','Reset your password','Enter the email linked to your existing BreakBench account.');
+ };
+ $c('cloudBack').onclick=()=>authView('login','Sign in to BreakBench','Enter your email and password.');
+ $c('cloudForgotForm').onsubmit=async e=>{
+  e.preventDefault();
+  const email=$c('cloudRecoveryEmail').value.trim();
+  const submit=$c('cloudSendRecovery');submit.disabled=true;
+  try{
+   const {error}=await client.auth.resetPasswordForEmail(email,{redirectTo:appRedirectUrl()});
+   if(error)throw error;
+   authView('login','Check your email','If that address has an account, Supabase will send a reset link. Open the newest email on this iPad, then choose your new password. Check spam too.');
+   $c('cloudEmail').value=email;
+  }catch(error){authView('forgot','Could not request a reset',error.message);}
+  finally{submit.disabled=false}
+ };
+ $c('cloudResetForm').onsubmit=async e=>{
+  e.preventDefault();
+  const pass=$c('cloudNewPassword').value,confirmPass=$c('cloudConfirmPassword').value;
+  if(pass.length<8)return authView('reset','Choose a longer password','Use at least 8 characters.');
+  if(pass!==confirmPass)return authView('reset','Passwords do not match','Enter the same password in both boxes.');
+  const submit=$c('cloudSetPassword');submit.disabled=true;
+  try{
+   const {data:sessionData}=await client.auth.getSession();
+   if(!sessionData.session)throw new Error('The reset link is missing or expired. Request a new email from Forgot password.');
+   const {error}=await client.auth.updateUser({password:pass});
+   if(error)throw error;
+   passwordSetupMode=false;passwordSetupReady=false;
+   $c('cloudNewPassword').value='';$c('cloudConfirmPassword').value='';
+   // An explicit fresh sign-in avoids relying on the temporary recovery session.
+   await client.auth.signOut();
+   memberUser=null;
+   authView('login','Password saved successfully','You can now sign in with your existing email and new password.');
+   logStatus('Password set · sign in');
+  }catch(error){authView('reset','Could not set password',error.message);}
+  finally{submit.disabled=false}
  };
  $c('cloudSignout').onclick=async()=>{memberUser=null;await client.auth.signOut();};
  $c('teamSignout').onclick=async()=>{if(!confirm('Sign out of BreakBench on this device?'))return;await flushCloud();memberUser=null;await client.auth.signOut();};
  $c('checkAccess').onclick=async()=>{const {data}=await client.auth.getSession();await sessionChanged(data.session)};
- client.auth.onAuthStateChange((_event,session)=>{setTimeout(()=>sessionChanged(session),0)});
- const {data,error}=await client.auth.getSession();if(error)show('Sign-in issue',error.message);else await sessionChanged(data.session);
+ client.auth.onAuthStateChange((event,session)=>{
+  if(event==='PASSWORD_RECOVERY'){passwordSetupMode=true;passwordSetupReady=true;}
+  if(passwordSetupMode && session){setTimeout(openPasswordSetup,0);return}
+  setTimeout(()=>sessionChanged(session),0);
+ });
+ const {data,error}=await client.auth.getSession();if(error)authView('login','Sign-in issue',error.message);else await sessionChanged(data.session);
 }
 init();
 })();
