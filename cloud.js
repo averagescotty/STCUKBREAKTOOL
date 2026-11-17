@@ -14,6 +14,30 @@ const incomingType = incomingParams.get('type') || new URLSearchParams(window.lo
 let passwordSetupMode = incomingType === 'recovery' || incomingType === 'invite';
 let passwordSetupReady = false;
 let sessionCheckSerial = 0;
+// Supabase may leave #type=recovery (and token fragments) in the page URL.
+// Remove *only after* the callback has been processed and password updated;
+// otherwise a later login or page reload can reopen the password setup screen.
+function clearAuthCallbackUrl(){
+ try {
+  const url = new URL(window.location.href);
+  const authParams = ['type','code','token','token_hash','access_token','refresh_token',
+    'expires_at','expires_in','provider_token','provider_refresh_token','error',
+    'error_code','error_description'];
+  for (const name of authParams) url.searchParams.delete(name);
+  const hashText = url.hash.replace(/^#/, '');
+  if (hashText && (authParams.some(name => new URLSearchParams(hashText).has(name)))) {
+    url.hash = '';
+  }
+  window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash);
+ } catch (e) { /* Password update is more important than URL tidying. */ }
+}
+function finishPasswordSetup(){
+ passwordSetupMode=false;
+ passwordSetupReady=false;
+ ++sessionCheckSerial; // Invalidate any delayed check from the recovery session.
+ clearAuthCallbackUrl();
+}
+
 function authView(mode, message, detail='') {
   show(message,detail);
   $c('cloudAuthForm').hidden = mode !== 'login';
@@ -194,7 +218,7 @@ async function init(){
    if(!sessionData.session)throw new Error('The reset link is missing or expired. Request a new email from Forgot password.');
    const {error}=await client.auth.updateUser({password:pass});
    if(error)throw error;
-   passwordSetupMode=false;passwordSetupReady=false;
+   finishPasswordSetup();
    $c('cloudNewPassword').value='';$c('cloudConfirmPassword').value='';
    // An explicit fresh sign-in avoids relying on the temporary recovery session.
    await client.auth.signOut();
@@ -204,12 +228,13 @@ async function init(){
   }catch(error){authView('reset','Could not set password',error.message);}
   finally{submit.disabled=false}
  };
- $c('cloudSignout').onclick=async()=>{memberUser=null;await client.auth.signOut();};
- $c('teamSignout').onclick=async()=>{if(!confirm('Sign out of BreakBench on this device?'))return;await flushCloud();memberUser=null;await client.auth.signOut();};
+ $c('cloudSignout').onclick=async()=>{finishPasswordSetup();memberUser=null;await client.auth.signOut();};
+ $c('teamSignout').onclick=async()=>{if(!confirm('Sign out of BreakBench on this device?'))return;await flushCloud();finishPasswordSetup();memberUser=null;await client.auth.signOut();};
  $c('checkAccess').onclick=async()=>{const {data}=await client.auth.getSession();await sessionChanged(data.session)};
  client.auth.onAuthStateChange((event,session)=>{
   if(event==='PASSWORD_RECOVERY'){passwordSetupMode=true;passwordSetupReady=true;}
-  if(passwordSetupMode && session){setTimeout(openPasswordSetup,0);return}
+  // Never schedule an unconditional reset view: the user may have just
+  // completed the reset while a SIGNED_IN/USER_UPDATED callback was queued.
   setTimeout(()=>sessionChanged(session),0);
  });
  const {data,error}=await client.auth.getSession();if(error)authView('login','Sign-in issue',error.message);else await sessionChanged(data.session);
