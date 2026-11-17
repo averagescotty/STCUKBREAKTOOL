@@ -1,4 +1,4 @@
-/* BreakBench v3 team adapter: shared Supabase backend with allowlisted Auth accounts. */
+/* BreakBench v3.3 team adapter: shared Supabase backend with allowlisted Auth accounts. */
 (() => {
 'use strict';
 const PROJECT_URL = 'https://avgqxqcbphlqjbcjxqjf.supabase.co';
@@ -8,6 +8,16 @@ const status = document.getElementById('cloudStatus');
 const $c = id => document.getElementById(id);
 let client, memberUser = null, rows = new Map(), writing = false, dirty = false, timer = null, remoteTimer = null, channel = null;
 const stable = v => JSON.stringify(v);
+const UNSENT_KEY='breakbench.unsent.v1';
+let inFlightRefresh=false;
+function saveLocalImmediately(){
+ try{localStorage.setItem(KEY,JSON.stringify(state));localStorage.setItem(UNSENT_KEY,'1')}catch{}
+}
+function hasUnsaved(){try{return localStorage.getItem(UNSENT_KEY)==='1'}catch{return false}}
+function clearUnsaved(){try{localStorage.removeItem(UNSENT_KEY)}catch{}}
+// Browser tab changes may interrupt timers; queue a cloud write before suspension.
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&dirty){clearTimeout(timer);void flushCloud()}});
+window.addEventListener('pagehide',()=>{if(dirty){clearTimeout(timer);void flushCloud()}});
 // Capture the link type before Supabase removes auth tokens from the URL.
 const incomingParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
 const incomingType = incomingParams.get('type') || new URLSearchParams(window.location.search).get('type');
@@ -86,14 +96,19 @@ function hydrate(list){
  render();
 }
 async function reloadCloud(){
- if(!memberUser)return;
+ if(!memberUser||dirty||writing||inFlightRefresh)return;
+ inFlightRefresh=true;
+ try{
  const {data,error}=await client.from('breakbench_items').select('id,kind,payload,updated_at,updated_by');
  if(error)throw error;
+ if(dirty||writing)return;
  hydrate(data||[]);
  logStatus('● Live · '+memberUser.email);
+ }finally{inFlightRefresh=false}
 }
-// Override legacy local-only autosave. Reads/writes now go through a secure shared database.
+// Override legacy autosave. Cache edits locally immediately and queue shared cloud writes.
 persist = function(){
+ saveLocalImmediately();
  if(!memberUser)return;
  dirty=true; logStatus('Saving…');
  clearTimeout(timer);timer=setTimeout(flushCloud,550);
@@ -122,6 +137,7 @@ async function flushCloud(){
   for(const record of upserts)rows.set(record.id,record);
   for(const id of removals)rows.delete(id);
   try{localStorage.setItem(KEY,JSON.stringify(state))}catch{}
+  if(!dirty)clearUnsaved();
   logStatus('✓ Saved · '+memberUser.email);
  }catch(err){
   dirty=true;
@@ -135,7 +151,8 @@ async function flushCloud(){
 }
 async function remoteRefresh(){
  remoteTimer=null;
- if(writing||dirty){remoteTimer=setTimeout(remoteRefresh,1200);return}
+ if(writing||dirty||inFlightRefresh){remoteTimer=setTimeout(remoteRefresh,1200);return}
+ if(document.visibilityState==='hidden'){remoteTimer=setTimeout(remoteRefresh,1500);return}
  // Avoid replacing an input while a teammate is actively typing.
  if(document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName) && !root.contains(document.activeElement)){
    remoteTimer=setTimeout(remoteRefresh,1500);return;
@@ -163,11 +180,17 @@ async function sessionChanged(session){
  }
  if(!session){memberUser=null;authView('login','Sign in to BreakBench','Only approved team members can access shared data.');logStatus('Sign in required');if(channel){client.removeChannel(channel);channel=null}return}
  const user=session.user;
+ // TOKEN_REFRESHED / focus revalidation should not re-hydrate the shared draft
+ // while the same team member is editing it in this tab.
+ if(memberUser?.id===user.id && !root.hidden){root.hidden=true;return}
+ if(memberUser?.id===user.id && root.hidden)return;
  const {data,error}=await client.from('breakbench_team_members').select('user_id').eq('user_id',user.id).maybeSingle();
  if(callId!==sessionCheckSerial)return;
  if(error){onError(error);return}
  if(!data){memberUser=null;authView('login','Account awaiting approval','Your email: '+user.email+'. A project owner must add this account to the team, then tap Check access.');$c('cloudAuthForm').hidden=true;$c('checkAccess').hidden=false;logStatus('Awaiting team approval');return}
  memberUser=user;
+ // If a previous tab suspension left unsent changes, send them before a reload.
+ if(hasUnsaved()){dirty=true;await flushCloud()}
  try{await reloadCloud();if(callId!==sessionCheckSerial)return;subscribe();root.hidden=true;$c('checkAccess').hidden=true;}
  catch(e){onError(e)}
 }
